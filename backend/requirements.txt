@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-multipart
+requests
+numpy
+pandas
+pyarrow
+scipy
+scikit-learn
+joblib
+matplotlib
+soundfile
+torch
+transformers
+imageio-ffmpeg
+pytest
