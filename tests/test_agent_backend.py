@@ -15,7 +15,7 @@ from backend.agent_service import (
     EmotionCompanionAgent,
     local_template_response,
 )
-from backend.backend_service import INDEX_HTML, analyze_audio_bytes, build_health_status
+from backend.backend_service import INDEX_HTML, _parse_multipart_audio, analyze_audio_bytes, build_health_status
 from backend.runtime_pipeline import (
     AudioBytesDecoder,
     DEFAULT_AUDIO_PIPELINE_PATH,
@@ -130,12 +130,37 @@ def test_agent_uses_injected_deepseek_client_and_parses_json_response(monkeypatc
 
 def test_backend_health_reports_deepseek_configuration(monkeypatch) -> None:
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
 
     health = build_health_status()
 
     assert health["status"] == "ok"
     assert health["deepseek"]["configured"] is False
     assert health["deepseek"]["base_url"] == "https://api.deepseek.com"
+    assert health["web_search"]["configured"] is False
+    assert health["web_search"]["provider"] == "zhipu"
+    assert health["web_search"]["engine"] == "search_pro_quark"
+    assert health["web_search"]["default_results"] == 5
+    assert health["web_search"]["max_results"] == 10
+
+
+def test_multipart_audio_parser_does_not_depend_on_removed_cgi_module() -> None:
+    boundary = "emo-agent-boundary"
+    raw = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="file"; filename="sample.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode("utf-8") + b"fake-audio-bytes" + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    audio_bytes, filename, content_type = _parse_multipart_audio(
+        raw,
+        f"multipart/form-data; boundary={boundary}",
+    )
+
+    assert audio_bytes == b"fake-audio-bytes"
+    assert filename == "sample.wav"
+    assert content_type == "audio/wav"
 
 
 def test_analyze_audio_bytes_combines_backend_analysis_with_agent_response(monkeypatch) -> None:
@@ -442,28 +467,29 @@ def test_fastapi_app_returns_json_for_analyzer_errors(monkeypatch) -> None:
 
 def test_upload_file_selection_updates_audio_player_preview() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    app_source = (project_root / "frontend" / "src" / "App.jsx").read_text(encoding="utf-8")
+    app_source = (project_root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
 
     assert "handleFileChange" in app_source
-    assert "selectedFileUrl" in app_source
-    assert "playerRef.current.src = selectedFileUrl.current" in app_source
-    assert "URL.revokeObjectURL(selectedFileUrl.current)" in app_source
+    assert "const previewUrl = setPreview(file)" in app_source
+    assert "URL.createObjectURL(blob)" in app_source
+    assert "audioUrlsRef.current.forEach" in app_source
+    assert 'className="message-audio"' in app_source
+    assert "message.audioUrl" in app_source
+    assert "chat-audio-preview" not in app_source
 
 
 def test_browser_recording_uses_supported_mime_type_and_filename() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    recording_source = (project_root / "frontend" / "src" / "recording.js").read_text(encoding="utf-8")
-    api_source = (project_root / "frontend" / "src" / "api.js").read_text(encoding="utf-8")
-    app_source = (project_root / "frontend" / "src" / "App.jsx").read_text(encoding="utf-8")
+    recording_source = (project_root / "frontend" / "src" / "recording.ts").read_text(encoding="utf-8")
+    api_source = (project_root / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
+    app_source = (project_root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
 
-    assert "selectRecorderFormat" in recording_source
     assert "createMediaRecorder" in recording_source
     assert "MediaRecorder.isTypeSupported" in recording_source
     assert "window.MediaRecorder" in recording_source
     assert "audio/mp4" in recording_source
-    assert "recordingFilename" in app_source
-    assert "analyzeBlob(recordingBlob, recordingFilename)" in app_source
-    assert "analyzeBlob(recordingBlob, 'recording.webm')" not in app_source
+    assert "extensionForMimeType(mimeType)" in app_source
+    assert "runAnalysis(blob, filename, previewUrl)" in app_source
     assert "raw_fetch" in api_source
     assert "X-Filename" in api_source
     assert "stage=" in api_source
@@ -471,19 +497,56 @@ def test_browser_recording_uses_supported_mime_type_and_filename() -> None:
 
 def test_react_frontend_keeps_recording_and_upload_fallbacks() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    recording_source = (project_root / "frontend" / "src" / "recording.js").read_text(encoding="utf-8")
-    api_source = (project_root / "frontend" / "src" / "api.js").read_text(encoding="utf-8")
-    app_source = (project_root / "frontend" / "src" / "App.jsx").read_text(encoding="utf-8")
+    recording_source = (project_root / "frontend" / "src" / "recording.ts").read_text(encoding="utf-8")
+    api_source = (project_root / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
+    app_source = (project_root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
 
     assert "MediaRecorder.isTypeSupported" in recording_source
     assert 'return "未连接麦克风"' in recording_source
     assert "Requested device not found" not in app_source
-    assert "analysisError.technicalDetail" in app_source
+    assert "typedError.technicalDetail" in app_source
     assert "无法连接分析服务" in api_source
     assert "分析服务配置不完整" in api_source
     assert "window.MediaRecorder" in recording_source
     assert "audio/mp4" in recording_source
-    assert "recordingFilename" in app_source
+    assert 'ACCEPTED_AUDIO_EXTENSIONS = ".wav,.mp3,.m4a,.flac,.webm"' in recording_source
+    assert 'aria-label="上传已有录音或音频文件"' in app_source
+    assert 'aria-label={uiState === "recording" ? "停止录音并分析" : "开始麦克风录音"}' in app_source
+    assert "runAnalysis(file, file.name, previewUrl)" in app_source
+    assert "runAnalysis(blob, filename, previewUrl)" in app_source
+    assert api_source.count('fetch("/api/analyze-audio"') == 2
     assert "raw_fetch" in api_source
     assert "X-Filename" in api_source
     assert "stage=" in api_source
+
+
+def test_figma_layout_keeps_text_input_and_removes_extra_controls() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    app_source = (project_root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+    assert '"用文字倾诉，或按麦克风说话…"' in app_source
+    assert "会话历史" in app_source
+    assert "快速标记情绪" in app_source
+    assert "舒缓工具" in app_source
+    assert "♀ 她" not in app_source
+    assert "♂ 他" not in app_source
+    assert "type Gender" not in app_source
+    assert "setGender" not in app_source
+    assert "隐私保护" not in app_source
+    assert "DeepSeek 已连接" not in app_source
+
+
+def test_frontend_exposes_search_evidence_and_formats_basic_markdown() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    app_source = (project_root / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+    api_source = (project_root / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
+
+    assert 'event === "tool_start" || event === "tool_result"' in api_source
+    assert "正在调用智谱夸克搜索" in app_source
+    assert "已联网检索" in app_source
+    assert "response.search_required && response.fallback_reason" in app_source
+    assert "function messageBlocks" in app_source
+    assert "Markdown single newlines are soft wraps" in app_source
+    assert 'className="bullet-content"' in app_source
+    assert "inlineMessageParts" in app_source
+    assert 'part.startsWith("**")' in app_source

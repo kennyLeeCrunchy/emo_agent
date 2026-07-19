@@ -51,7 +51,7 @@ class AgentInput:
 class DeepSeekConfig:
     api_key: str | None = None
     base_url: str = "https://api.deepseek.com"
-    model: str = "deepseek-chat"
+    model: str = "deepseek-v4-flash"
     timeout: float = 30.0
 
     @classmethod
@@ -59,7 +59,7 @@ class DeepSeekConfig:
         return cls(
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
-            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
             timeout=float(os.environ.get("DEEPSEEK_TIMEOUT", "30")),
         )
 

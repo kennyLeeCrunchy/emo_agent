@@ -1,6 +1,15 @@
 # Emo Agent Frontend
 
-React + Vite frontend for the Module 7 local FastAPI demo.
+Product frontend built with Vite, React, TypeScript/TSX, Tailwind CSS and Radix-style components. The visual direction is based on the Figma Make export, while all displayed analysis data comes from the real FastAPI backend.
+
+The conversation input keeps two first-class audio entry points:
+
+- microphone recording;
+- upload an existing `.wav`, `.mp3`, `.m4a`, `.flac`, or `.webm` file.
+
+Both call `POST /api/analyze-audio`. Uploads try multipart first and fall back to a raw request body with `Content-Type` and `X-Filename` when needed.
+
+Text messages call `POST /api/agent/chat/stream` and consume SSE events for incremental replies. If streaming is unavailable, the frontend falls back to `POST /api/agent/chat`. The backend uses the DeepSeek tool-calling loop when configured and a local safe response when no API key is available.
 
 ## Install
 

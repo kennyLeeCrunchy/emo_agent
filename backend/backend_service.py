@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import cgi
-import io
 import json
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from backend.agent_service import AgentInput, DeepSeekConfig, EmotionCompanionAgent
 from backend.runtime_pipeline import LazyFullAudioAnalyzer
+from backend.tool_service import WebSearchConfig
 
 
 class PlaceholderAudioAnalyzer:
@@ -43,8 +44,30 @@ class PlaceholderAudioAnalyzer:
         }
 
 
-def build_health_status(config: DeepSeekConfig | None = None) -> dict[str, Any]:
+def _parse_multipart_audio(raw: bytes, content_type: str) -> tuple[bytes, str | None, str | None]:
+    """Extract the first form-data field named ``file`` without the removed cgi module."""
+    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+    message = BytesParser(policy=email_policy).parsebytes(header + raw)
+    if not message.is_multipart():
+        raise ValueError("request body is not valid multipart form data.")
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        if part.get_param("name", header="content-disposition") != "file":
+            continue
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes):
+            payload = b""
+        return payload, part.get_filename(), part.get_content_type()
+    raise ValueError("multipart form must include a file field named 'file'.")
+
+
+def build_health_status(
+    config: DeepSeekConfig | None = None,
+    search_config: WebSearchConfig | None = None,
+) -> dict[str, Any]:
     config = config or DeepSeekConfig.from_env()
+    search_config = search_config or WebSearchConfig.from_env()
     return {
         "status": "ok",
         "service": "emo-agent-local-backend",
@@ -53,7 +76,19 @@ def build_health_status(config: DeepSeekConfig | None = None) -> dict[str, Any]:
             "base_url": config.base_url,
             "model": config.model,
         },
-        "endpoints": ["/api/health", "/api/analyze-audio"],
+        "web_search": {
+            "configured": search_config.configured,
+            "provider": "zhipu",
+            "engine": search_config.engine,
+            "default_results": search_config.default_results,
+            "max_results": search_config.max_results,
+        },
+        "endpoints": [
+            "/api/health",
+            "/api/analyze-audio",
+            "/api/agent/chat",
+            "/api/agent/chat/stream",
+        ],
     }
 
 
@@ -113,16 +148,7 @@ def create_handler(analyzer: Any | None = None, agent: EmotionCompanionAgent | N
                 raise ValueError("Request body is empty.")
             raw = self.rfile.read(length)
             if content_type.startswith("multipart/form-data"):
-                environ = {
-                    "REQUEST_METHOD": "POST",
-                    "CONTENT_TYPE": content_type,
-                    "CONTENT_LENGTH": str(length),
-                }
-                form = cgi.FieldStorage(fp=io.BytesIO(raw), headers=self.headers, environ=environ)
-                field = form["file"] if "file" in form else None
-                if field is None or not getattr(field, "file", None):
-                    raise ValueError("multipart form must include a file field named 'file'.")
-                return field.file.read(), field.filename, field.type
+                return _parse_multipart_audio(raw, content_type)
             return raw, self.headers.get("X-Filename"), content_type
 
         def _send_json(self, status: int, payload: dict[str, Any]) -> None:
