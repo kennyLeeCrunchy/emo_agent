@@ -1,0 +1,12 @@
+# Copy outside the repository, replace the placeholders, then run:
+# cloudflared tunnel --config <absolute-path-to-config.yml> run
+tunnel: REPLACE_WITH_TUNNEL_UUID
+credentials-file: C:\Users\REPLACE_ME\.cloudflared\REPLACE_WITH_TUNNEL_UUID.json
+
+ingress:
+  - hostname: emo-agent-api.example.com
+    service: http://127.0.0.1:7860
+    originRequest:
+      connectTimeout: 10s
+      noHappyEyeballs: false
+  - service: http_status:404

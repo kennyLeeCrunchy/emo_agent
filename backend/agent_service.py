@@ -2,21 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Callable
-
-
-AGENT_OUTPUT_FIELDS = [
-    "main_emotion_summary",
-    "curve_interpretation",
-    "possible_reasons",
-    "companion_response",
-    "gentle_suggestion",
-    "safety_note",
-    "uncertainty_notes",
-]
 
 
 @dataclass
@@ -43,16 +31,27 @@ class AgentInput:
             filtered["asr_text"] = ""
         return cls(**filtered)
 
-    def to_payload(self) -> dict[str, Any]:
-        return asdict(self)
-
-
 @dataclass
 class DeepSeekConfig:
     api_key: str | None = None
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-v4-flash"
     timeout: float = 30.0
+    max_tokens: int = 1000
+    summary_max_tokens: int = 1500
+    max_input_chars: int = 2000
+    max_history_chars: int = 200000
+    max_tool_result_chars: int = 3000
+    max_tool_results_tokens: int = 6000
+    context_trigger_tokens: int = 49152
+    context_target_tokens: int = 32768
+    context_hard_tokens: int = 65536
+    recent_message_limit: int = 20
+    recent_message_keep: int = 8
+    summary_retry_attempts: int = 3
+    summary_retry_delay_seconds: float = 30.0
+    summary_cooldown_seconds: int = 600
+    enable_web_search: bool = True
 
     @classmethod
     def from_env(cls) -> "DeepSeekConfig":
@@ -61,6 +60,22 @@ class DeepSeekConfig:
             base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
             model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
             timeout=float(os.environ.get("DEEPSEEK_TIMEOUT", "30")),
+            max_tokens=int(os.environ.get("DEEPSEEK_MAX_TOKENS", "1000")),
+            summary_max_tokens=int(os.environ.get("DEEPSEEK_SUMMARY_MAX_TOKENS", "1500")),
+            max_input_chars=int(os.environ.get("DEEPSEEK_MAX_INPUT_CHARS", "2000")),
+            max_history_chars=int(os.environ.get("DEEPSEEK_MAX_HISTORY_CHARS", "200000")),
+            max_tool_result_chars=int(os.environ.get("DEEPSEEK_MAX_TOOL_RESULT_CHARS", "3000")),
+            max_tool_results_tokens=int(os.environ.get("DEEPSEEK_MAX_TOOL_RESULTS_TOKENS", "6000")),
+            context_trigger_tokens=int(os.environ.get("DEEPSEEK_CONTEXT_TRIGGER_TOKENS", "49152")),
+            context_target_tokens=int(os.environ.get("DEEPSEEK_CONTEXT_TARGET_TOKENS", "32768")),
+            context_hard_tokens=int(os.environ.get("DEEPSEEK_CONTEXT_HARD_TOKENS", "65536")),
+            recent_message_limit=int(os.environ.get("DEEPSEEK_RECENT_MESSAGE_LIMIT", "20")),
+            recent_message_keep=int(os.environ.get("DEEPSEEK_RECENT_MESSAGE_KEEP", "8")),
+            summary_retry_attempts=int(os.environ.get("DEEPSEEK_SUMMARY_RETRY_ATTEMPTS", "3")),
+            summary_retry_delay_seconds=float(os.environ.get("DEEPSEEK_SUMMARY_RETRY_DELAY_SECONDS", "30")),
+            summary_cooldown_seconds=int(os.environ.get("DEEPSEEK_SUMMARY_COOLDOWN_SECONDS", "600")),
+            enable_web_search=os.environ.get("DEEPSEEK_ENABLE_WEB_SEARCH", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -70,6 +85,10 @@ class DeepSeekConfig:
     @property
     def chat_url(self) -> str:
         return f"{self.base_url.rstrip('/')}/chat/completions"
+
+    @property
+    def responses_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}/responses"
 
     def __repr__(self) -> str:
         masked_key = "***" if self.api_key else None
@@ -96,68 +115,6 @@ class EmotionCompanionAgent:
     ) -> None:
         self.config = config or DeepSeekConfig.from_env()
         self.post_json = post_json or default_post_json
-
-    def generate(self, agent_input: AgentInput | dict[str, Any]) -> dict[str, Any]:
-        if isinstance(agent_input, dict):
-            agent_input = AgentInput.from_mapping(agent_input)
-
-        if not self.config.configured:
-            return local_template_response(agent_input, reason="missing_api_key")
-
-        try:
-            raw = self.post_json(
-                self.config.chat_url,
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json",
-                },
-                payload=build_deepseek_payload(agent_input, self.config.model),
-                timeout=self.config.timeout,
-            )
-            parsed = parse_deepseek_response(raw)
-            parsed["provider"] = "deepseek"
-            return ensure_agent_output(parsed, fallback_input=agent_input)
-        except Exception as exc:
-            return local_template_response(agent_input, reason=f"deepseek_error:{type(exc).__name__}")
-
-
-def build_deepseek_payload(agent_input: AgentInput, model: str) -> dict[str, Any]:
-    return {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "agent_input": agent_input.to_payload(),
-                        "privacy_note": "Only structured text evidence and model outputs are provided. Raw audio is not included.",
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
-        "temperature": 0.4,
-        "response_format": {"type": "json_object"},
-    }
-
-
-def parse_deepseek_response(raw: dict[str, Any]) -> dict[str, Any]:
-    content = raw["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
-    if not isinstance(parsed, dict):
-        raise ValueError("DeepSeek content must be a JSON object.")
-    return parsed
-
-
-def ensure_agent_output(output: dict[str, Any], fallback_input: AgentInput) -> dict[str, Any]:
-    fallback = local_template_response(fallback_input, reason="incomplete_deepseek_output")
-    provider = output.get("provider", "deepseek")
-    normalized = {field: output.get(field, fallback[field]) for field in AGENT_OUTPUT_FIELDS}
-    if not isinstance(normalized["uncertainty_notes"], list):
-        normalized["uncertainty_notes"] = [str(normalized["uncertainty_notes"])]
-    normalized["provider"] = provider
-    return normalized
 
 
 def local_template_response(agent_input: AgentInput, reason: str = "fallback") -> dict[str, Any]:
@@ -223,22 +180,3 @@ def _has_crisis_signal(agent_input: AgentInput) -> bool:
         if isinstance(item, dict) and item.get("category") == "self_harm_risk":
             return True
     return False
-
-
-SYSTEM_PROMPT = """你是一个中文语音情绪分析原型系统中的“情绪陪伴 Agent”。
-
-你的任务不是重新进行情绪分类，也不是做心理诊断。你只能基于用户提供的结构化输入进行解释和回应。
-
-必须遵守：
-1. 不进行医学、心理疾病或精神健康诊断。
-2. 不给用户贴病理标签。
-3. 不使用“你一定”“你肯定”等绝对化表达。
-4. 使用“可能”“看起来”“似乎”“从当前证据看”等审慎表达。
-5. 不夸大模型能力，不把模型预测说成事实。
-6. 当置信度低、模态结果不一致或 ASR 文本噪声较大时，必须明确保留不确定性。
-7. 如出现自伤、自杀、伤害他人或严重危机表达，应温和建议联系可信赖的人、当地紧急服务或专业支持。
-
-输出必须是 JSON 对象，字段为：
-main_emotion_summary, curve_interpretation, possible_reasons,
-companion_response, gentle_suggestion, safety_note, uncertainty_notes。
-"""

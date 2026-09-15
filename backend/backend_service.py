@@ -8,9 +8,8 @@ from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from backend.agent_service import AgentInput, DeepSeekConfig, EmotionCompanionAgent
+from backend.agent_service import AgentInput, DeepSeekConfig, EmotionCompanionAgent, local_template_response
 from backend.runtime_pipeline import LazyFullAudioAnalyzer
-from backend.tool_service import WebSearchConfig
 
 
 class PlaceholderAudioAnalyzer:
@@ -62,12 +61,8 @@ def _parse_multipart_audio(raw: bytes, content_type: str) -> tuple[bytes, str | 
     raise ValueError("multipart form must include a file field named 'file'.")
 
 
-def build_health_status(
-    config: DeepSeekConfig | None = None,
-    search_config: WebSearchConfig | None = None,
-) -> dict[str, Any]:
+def build_health_status(config: DeepSeekConfig | None = None) -> dict[str, Any]:
     config = config or DeepSeekConfig.from_env()
-    search_config = search_config or WebSearchConfig.from_env()
     return {
         "status": "ok",
         "service": "emo-agent-local-backend",
@@ -77,11 +72,9 @@ def build_health_status(
             "model": config.model,
         },
         "web_search": {
-            "configured": search_config.configured,
-            "provider": "zhipu",
-            "engine": search_config.engine,
-            "default_results": search_config.default_results,
-            "max_results": search_config.max_results,
+            "configured": config.configured and config.enable_web_search,
+            "provider": "deepseek_native",
+            "api": "responses",
         },
         "endpoints": [
             "/api/health",
@@ -97,12 +90,12 @@ def analyze_audio_bytes(
     filename: str | None = None,
     content_type: str | None = None,
     analyzer: Any | None = None,
-    agent: EmotionCompanionAgent | None = None,
 ) -> dict[str, Any]:
     analyzer = analyzer or PlaceholderAudioAnalyzer()
-    agent = agent or EmotionCompanionAgent()
     analysis = analyzer.analyze(audio_bytes, filename=filename, content_type=content_type)
-    feedback = agent.generate(AgentInput.from_mapping(analysis))
+    # The legacy standalone page keeps a deterministic fallback. The production
+    # FastAPI path replaces this with the unified AgentOrchestrator response.
+    feedback = local_template_response(AgentInput.from_mapping(analysis), reason="standalone_local_fallback")
     return {
         "ok": True,
         "analysis": analysis,
@@ -135,7 +128,6 @@ def create_handler(analyzer: Any | None = None, agent: EmotionCompanionAgent | N
                     filename=filename,
                     content_type=content_type,
                     analyzer=analyzer,
-                    agent=agent,
                 )
                 self._send_json(200, result)
             except Exception as exc:

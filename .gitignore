@@ -8,6 +8,7 @@ __pycache__/
 
 .env
 .env.*
+!Sites/.env.example
 *.pem
 *.key
 *.crt
@@ -16,6 +17,10 @@ pem/
 frontend/node_modules/
 frontend/.npm-cache/
 frontend/dist/
+
+backend/data/*.sqlite3
+backend/data/*.sqlite3-shm
+backend/data/*.sqlite3-wal
 
 .agents/
 

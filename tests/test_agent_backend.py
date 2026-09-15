@@ -30,6 +30,8 @@ from backend.runtime_pipeline import (
     predict_with_pipeline,
 )
 from backend.fastapi_app import create_app
+from backend.memory_service import MemoryService
+from backend.security import SecuritySettings
 
 
 def test_runtime_default_paths_are_resolved_from_repository_root() -> None:
@@ -91,47 +93,8 @@ def test_local_template_response_returns_safe_five_part_output() -> None:
     assert forbidden not in json.dumps(response, ensure_ascii=False)
 
 
-def test_agent_uses_injected_deepseek_client_and_parses_json_response(monkeypatch) -> None:
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret-key")
-    calls = []
-
-    def fake_post(url: str, headers: dict[str, str], payload: dict[str, object], timeout: float) -> dict[str, object]:
-        calls.append({"url": url, "headers": headers, "payload": payload, "timeout": timeout})
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "main_emotion_summary": "从融合结果看，当前主要情绪可能偏 sad。",
-                                "curve_interpretation": "曲线显示 sad 概率有上升。",
-                                "possible_reasons": "可能与疲惫感和缺少支持有关。",
-                                "companion_response": "听起来这段时间确实有些累，可以先允许自己缓一缓。",
-                                "gentle_suggestion": "先喝点水，做三次慢呼吸。",
-                                "safety_note": "本系统不用于医疗诊断。",
-                                "uncertainty_notes": [],
-                            },
-                            ensure_ascii=False,
-                        )
-                    }
-                }
-            ]
-        }
-
-    agent = EmotionCompanionAgent(config=DeepSeekConfig.from_env(), post_json=fake_post)
-    response = agent.generate(sample_agent_input())
-
-    assert response["provider"] == "deepseek"
-    assert response["gentle_suggestion"] == "先喝点水，做三次慢呼吸。"
-    assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
-    assert calls[0]["headers"]["Authorization"] == "Bearer secret-key"
-    assert "原始音频" not in json.dumps(calls[0]["payload"], ensure_ascii=False)
-
-
 def test_backend_health_reports_deepseek_configuration(monkeypatch) -> None:
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.delenv("ZHIPU_SEARCH_API_KEY", raising=False)
-    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
 
     health = build_health_status()
 
@@ -139,10 +102,8 @@ def test_backend_health_reports_deepseek_configuration(monkeypatch) -> None:
     assert health["deepseek"]["configured"] is False
     assert health["deepseek"]["base_url"] == "https://api.deepseek.com"
     assert health["web_search"]["configured"] is False
-    assert health["web_search"]["provider"] == "zhipu"
-    assert health["web_search"]["engine"] == "search_pro_quark"
-    assert health["web_search"]["default_results"] == 5
-    assert health["web_search"]["max_results"] == 10
+    assert health["web_search"]["provider"] == "deepseek_native"
+    assert health["web_search"]["api"] == "responses"
 
 
 def test_multipart_audio_parser_does_not_depend_on_removed_cgi_module() -> None:
@@ -190,12 +151,73 @@ def test_analyze_audio_bytes_combines_backend_analysis_with_agent_response(monke
         filename="sample.wav",
         content_type="audio/wav",
         analyzer=FakeAnalyzer(),
-        agent=EmotionCompanionAgent(config=DeepSeekConfig(api_key=None)),
     )
 
     assert result["ok"] is True
     assert result["analysis"]["fusion_prediction"] == "sad"
     assert result["agent_feedback"]["provider"] == "local_template"
+
+
+def test_audio_upload_uses_unified_companion_prompt_and_persists_once(tmp_path) -> None:
+    calls: list[dict] = []
+
+    class FakeAnalyzer:
+        def analyze(self, *_args, **_kwargs) -> dict:
+            return {
+                "asr_text": "今天真的很累。",
+                "audio_prediction": "sad",
+                "text_prediction": "sad",
+                "fusion_prediction": "sad",
+                "fusion_confidence": 0.86,
+                "emotion_curve": [],
+                "keywords": [{"keyword": "很累", "category": "fatigue"}],
+                "emotion_change_points": [],
+                "possible_reasons": [{"text": "可能与疲惫感有关。"}],
+            }
+
+    def fake_post(url: str, headers: dict[str, str], payload: dict, timeout: float) -> dict:
+        calls.append({"url": url, "headers": headers, "payload": payload, "timeout": timeout})
+        return {"choices": [{"message": {"role": "assistant", "content": "听起来你今天很累，我们可以先慢一点。"}}]}
+
+    memory = MemoryService(tmp_path / "memory.sqlite3")
+    agent = EmotionCompanionAgent(
+        config=DeepSeekConfig(api_key="test-key"),
+        post_json=fake_post,
+    )
+    app = create_app(
+        analyzer=FakeAnalyzer(),
+        agent=agent,
+        memory=memory,
+        frontend_dist=None,
+        security=SecuritySettings(llm_budget_db=str(tmp_path / "quota.sqlite3")),
+    )
+
+    from fastapi.testclient import TestClient
+
+    response = TestClient(app).post(
+        "/api/analyze-audio",
+        files={"file": ("sample.wav", b"audio", "audio/wav")},
+        headers={"X-User-Id": "u1", "X-Session-Id": "s1", "X-Request-Id": "audio-1"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent_feedback"] == {
+        "companion_response": "听起来你今天很累，我们可以先慢一点。",
+        "provider": "deepseek",
+    }
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/chat/completions")
+    assert "心伴" in calls[0]["payload"]["messages"][0]["content"]
+    assert "中文语音情绪分析原型系统" not in json.dumps(calls[0]["payload"], ensure_ascii=False)
+    assert "response_format" not in calls[0]["payload"]
+    assert "local_fusion_prediction" in calls[0]["payload"]["messages"][-1]["content"]
+    messages = memory.get_messages("u1", "s1", limit=20)
+    assert [(item["role"], item["content"]) for item in messages] == [
+        ("user", "今天真的很累。"),
+        ("assistant", "听起来你今天很累，我们可以先慢一点。"),
+    ]
+    assert memory.summary("u1", "s1")["long_term"]["trend"]["event_count"] == 1
 
 
 def test_audio_decoder_discovers_imageio_ffmpeg_when_system_path_missing() -> None:
@@ -542,7 +564,7 @@ def test_frontend_exposes_search_evidence_and_formats_basic_markdown() -> None:
     api_source = (project_root / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
 
     assert 'event === "tool_start" || event === "tool_result"' in api_source
-    assert "正在调用智谱夸克搜索" in app_source
+    assert "正在使用 DeepSeek 原生联网搜索" in app_source
     assert "已联网检索" in app_source
     assert "response.search_required && response.fallback_reason" in app_source
     assert "function messageBlocks" in app_source

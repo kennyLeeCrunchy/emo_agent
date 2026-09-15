@@ -53,12 +53,14 @@ export interface AgentFeedback {
 
 export interface AnalysisResponse {
   ok?: boolean;
+  session_id?: string;
   analysis?: AudioAnalysis;
   agent_feedback?: AgentFeedback;
 }
 
 export interface HealthResponse {
   deepseek?: { configured?: boolean };
+  memory?: { configured?: boolean; backend?: string };
 }
 
 export interface ChatHistoryItem {
@@ -68,7 +70,9 @@ export interface ChatHistoryItem {
 
 export interface AgentChatRequest {
   message: string;
+  user_id?: string;
   session_id?: string;
+  request_id?: string;
   history?: ChatHistoryItem[];
   latest_analysis?: AudioAnalysis;
 }
@@ -90,7 +94,76 @@ export interface AgentChatResponse {
   response: string;
   provider: string;
   session_id: string;
+  request_id?: string;
   tool_calls: AgentToolCall[];
   fallback_reason?: string;
   search_required?: boolean;
+}
+
+export interface SessionRecord {
+  session_id: string;
+  user_id: string;
+  title: string;
+  current_emotion?: string;
+  current_confidence?: number;
+  latest_analysis?: AudioAnalysis;
+  preview?: string;
+  message_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StoredMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  emotion?: string;
+  created_at: string;
+}
+
+export interface SessionDetailResponse {
+  ok: boolean;
+  session: SessionRecord;
+  messages: StoredMessage[];
+}
+
+export interface MemoryTrendPoint {
+  date: string;
+  dominant_emotion?: string;
+  count: number;
+  average_confidence?: number;
+}
+
+export interface MemoryTrend {
+  available: boolean;
+  scope: "memory_trend";
+  range_days: number;
+  event_count: number;
+  dominant_emotion?: string;
+  emotion_counts: Record<string, number>;
+  common_triggers: Array<{ text: string; count: number }>;
+  points: MemoryTrendPoint[];
+  note: string;
+}
+
+export interface MemoryPreference {
+  key: string;
+  value: string;
+  source: string;
+  confirmed: boolean;
+  updated_at: string;
+}
+
+export interface MemorySummaryResponse {
+  ok: boolean;
+  user_id: string;
+  short_term: {
+    session?: SessionRecord;
+    recent_messages: StoredMessage[];
+  };
+  long_term: {
+    trend: MemoryTrend;
+    preferences: MemoryPreference[];
+  };
+  safety_note: string;
 }

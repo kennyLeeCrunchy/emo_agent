@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import {
   Activity,
+  AlertTriangle,
   AudioLines,
   CheckCircle2,
   ChevronRight,
@@ -17,12 +18,13 @@ import {
   Plus,
   Send,
   Sparkles,
+  Trash2,
   Upload,
   UserRound,
   Waves,
   Wind
 } from "lucide-react";
-import { analyzeAudioBlob, chatWithAgent, streamAgentChat } from "./api";
+import { analyzeAudioBlob, chatWithAgent, deleteSession, fetchMemorySummary, fetchSession, listSessions, streamAgentChat } from "./api";
 import { emotionInfo, formatPercent } from "./emotions";
 import {
   ACCEPTED_AUDIO_EXTENSIONS,
@@ -32,7 +34,17 @@ import {
   explainRecordingUnavailable,
   extensionForMimeType
 } from "./recording";
-import type { AgentToolCall, AnalysisResponse, AudioAnalysis, EmotionCurvePoint, EvidenceItem } from "./types";
+import type {
+  AgentToolCall,
+  AnalysisResponse,
+  AudioAnalysis,
+  EmotionCurvePoint,
+  EvidenceItem,
+  MemorySummaryResponse,
+  MemoryTrend,
+  SessionRecord,
+  StoredMessage
+} from "./types";
 
 type UiState = "idle" | "recording" | "analyzing" | "ready" | "error";
 
@@ -49,13 +61,13 @@ interface ChatMessage {
 
 const waveHeights = [8, 18, 28, 38, 42, 48, 44, 36, 26, 16, 10, 20, 32, 44, 40, 30, 18, 12, 22, 34, 46, 42, 32, 20, 14];
 
-const sessionShells = [
-  ["当前对话", "刚刚"],
-  ["关于工作压力的倾诉", "昨天 22:15"],
-  ["夜晚的孤独感", "周三 19:45"],
-  ["和家人的一次交流", "上周 11:20"],
-  ["对未来的想法", "上周 16:08"]
-];
+const greetingMessage: ChatMessage = {
+  id: 1,
+  role: "ai",
+  text: "你好，我是心伴。今天感觉怎么样？无论你想聊什么，我都在这里陪着你。",
+  time: nowTime(),
+  emotion: "平静"
+};
 
 const quickEmotions = [
   ["平静", "#8ba8dc"], ["开心", "#ffc670"], ["悲伤", "#788cc8"],
@@ -64,6 +76,39 @@ const quickEmotions = [
 
 function nowTime() {
   return new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function newRequestId() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function getLocalUserId() {
+  const storageKey = "emo-agent-local-user-id";
+  try {
+    const existing = window.localStorage.getItem(storageKey);
+    if (existing) return existing;
+    const created = `local-${newRequestId()}`;
+    window.localStorage.setItem(storageKey, created);
+    return created;
+  } catch {
+    return "local-user";
+  }
+}
+
+function sessionTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function storedMessageToChat(message: StoredMessage): ChatMessage {
+  return {
+    id: message.id,
+    role: message.role === "assistant" ? "ai" : "user",
+    text: message.content,
+    time: new Date(message.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
+    emotion: message.emotion ? emotionInfo(message.emotion).label : undefined
+  };
 }
 
 function evidenceText(item: EvidenceItem | string) {
@@ -202,6 +247,33 @@ function EmotionCurve({ analysis }: { analysis: AudioAnalysis }) {
   );
 }
 
+function LongTermTrend({ trend }: { trend?: MemoryTrend }) {
+  if (!trend?.available || !trend.points.length) {
+    return <div className="curve-empty"><Activity size={18} />还没有足够的跨会话情绪记录</div>;
+  }
+  const maxCount = Math.max(1, ...trend.points.map((point) => point.count));
+  return (
+    <div className="memory-trend" aria-label="近三十天跨会话情绪趋势">
+      <div className="trend-summary">
+        <span>近 {trend.range_days} 天 · {trend.event_count} 条事件</span>
+        <strong>主要为 {emotionInfo(trend.dominant_emotion).label}</strong>
+      </div>
+      <div className="trend-bars">
+        {trend.points.map((point) => {
+          const info = emotionInfo(point.dominant_emotion);
+          return (
+            <div className="trend-day" key={point.date} title={`${point.date} · ${info.label} · ${point.count} 条`}>
+              <i style={{ height: `${Math.max(18, point.count / maxCount * 100)}%`, background: info.color }} />
+              <small>{point.date.slice(5)}</small>
+            </div>
+          );
+        })}
+      </div>
+      <p>{trend.note}</p>
+    </div>
+  );
+}
+
 function Avatar({ role }: { role: "user" | "ai" }) {
   return (
     <span className={`chat-avatar ${role}`}>
@@ -217,21 +289,32 @@ export default function App() {
   const chunksRef = useRef<Blob[]>([]);
   const audioUrlsRef = useRef<Set<string>>(new Set());
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [userId] = useState(getLocalUserId);
   const [uiState, setUiState] = useState<UiState>("idle");
   const [result, setResult] = useState<AnalysisResponse | null>(null);
   const [error, setError] = useState("");
   const [inputText, setInputText] = useState("");
   const [isChatting, setIsChatting] = useState(false);
   const [sessionId, setSessionId] = useState("");
-  const [manualEmotion, setManualEmotion] = useState("平静");
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    { id: 1, role: "ai", text: "你好，我是心伴。今天感觉怎么样？无论你想聊什么，我都在这里陪着你。", time: nowTime(), emotion: "平静" }
-  ]);
+  const [sessions, setSessions] = useState<SessionRecord[]>([]);
+  const [memorySummary, setMemorySummary] = useState<MemorySummaryResponse | null>(null);
+  const [isLoadingSessions, setIsLoadingSessions] = useState(true);
+  const [pendingDelete, setPendingDelete] = useState<SessionRecord | null>(null);
+  const [isDeletingSession, setIsDeletingSession] = useState(false);
+  const [notice, setNotice] = useState("");
+  // A selected quick label intentionally takes precedence over the latest
+  // automatic prediction until the user clicks the same label again.
+  const [manualEmotion, setManualEmotion] = useState<string | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([greetingMessage]);
 
   const analysis = result?.analysis || {};
   const fusionInfo = emotionInfo(analysis.fusion_prediction);
-  const currentEmotion = analysis.fusion_prediction ? fusionInfo.label : manualEmotion;
-  const currentColor = analysis.fusion_prediction ? fusionInfo.color : quickEmotions.find(([label]) => label === manualEmotion)?.[1] || "#8ba8dc";
+  const detectedEmotion = analysis.fusion_prediction ? fusionInfo.label : "平静";
+  const detectedColor = analysis.fusion_prediction ? fusionInfo.color : "#8ba8dc";
+  const currentEmotion = manualEmotion || detectedEmotion;
+  const currentColor = manualEmotion
+    ? quickEmotions.find(([label]) => label === manualEmotion)?.[1] || "#8ba8dc"
+    : detectedColor;
   const keywords = analysis.keywords || [];
   const reasons = analysis.possible_reasons || [];
 
@@ -245,11 +328,112 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  useEffect(() => {
+    void (async () => {
+      try {
+        const items = await listSessions(userId);
+        setSessions(items);
+        if (items[0]) await loadSession(items[0].session_id);
+        else setMemorySummary(await fetchMemorySummary(userId));
+      } catch (loadError) {
+        console.warn("会话记忆加载失败", loadError);
+      } finally {
+        setIsLoadingSessions(false);
+      }
+    })();
+  }, [userId]);
+
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     audioUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     audioUrlsRef.current.clear();
   }, []);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 3200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  useEffect(() => {
+    if (!pendingDelete) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !isDeletingSession) setPendingDelete(null);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [pendingDelete, isDeletingSession]);
+
+  async function refreshMemory(activeSessionId = sessionId) {
+    try {
+      setMemorySummary(await fetchMemorySummary(userId, activeSessionId || undefined));
+    } catch (loadError) {
+      console.warn("记忆摘要加载失败", loadError);
+    }
+  }
+
+  async function refreshSessions() {
+    try {
+      setSessions(await listSessions(userId));
+    } catch (loadError) {
+      console.warn("会话历史刷新失败", loadError);
+    }
+  }
+
+  function toggleManualEmotion(label: string) {
+    setManualEmotion((current) => current === label ? null : label);
+  }
+
+  async function loadSession(nextSessionId: string) {
+    try {
+      const detail = await fetchSession(userId, nextSessionId);
+      setSessionId(nextSessionId);
+      setMessages(detail.messages.length ? detail.messages.map(storedMessageToChat) : [greetingMessage]);
+      const latestAnalysis = detail.session.latest_analysis || {};
+      setResult(Object.keys(latestAnalysis).length ? { ok: true, session_id: nextSessionId, analysis: latestAnalysis } : null);
+      setUiState(Object.keys(latestAnalysis).length ? "ready" : "idle");
+      setError("");
+      await refreshMemory(nextSessionId);
+    } catch (loadError) {
+      console.error("读取会话失败", loadError);
+      setError("这段会话暂时无法读取，请稍后重试");
+    }
+  }
+
+  function startNewSession() {
+    setSessionId("");
+    setMessages([{ ...greetingMessage, id: Date.now(), time: nowTime() }]);
+    setResult(null);
+    setUiState("idle");
+    setError("");
+    void refreshMemory("");
+  }
+
+  async function confirmDeleteSession() {
+    if (!pendingDelete || isDeletingSession) return;
+    const targetId = pendingDelete.session_id;
+    const deletingActiveSession = targetId === sessionId;
+    setIsDeletingSession(true);
+    setError("");
+    try {
+      await deleteSession(userId, targetId);
+      const remaining = sessions.filter((item) => item.session_id !== targetId);
+      setSessions(remaining);
+      setPendingDelete(null);
+      setNotice("会话及其关联记忆已从本地服务器删除");
+      if (deletingActiveSession) {
+        if (remaining[0]) await loadSession(remaining[0].session_id);
+        else startNewSession();
+      } else {
+        await refreshMemory(sessionId);
+      }
+    } catch (deleteError) {
+      console.error("删除会话失败", deleteError);
+      setError("删除失败，请确认后端服务正常后重试");
+    } finally {
+      setIsDeletingSession(false);
+    }
+  }
 
   function setPreview(blob: Blob) {
     const url = URL.createObjectURL(blob);
@@ -276,10 +460,17 @@ export default function App() {
     setUiState("analyzing");
     setError("");
     try {
-      const data = await analyzeAudioBlob(blob, filename);
+      const data = await analyzeAudioBlob(blob, filename, {
+        userId,
+        sessionId: sessionId || undefined,
+        requestId: newRequestId()
+      });
+      const activeSessionId = data.session_id || sessionId;
+      if (activeSessionId) setSessionId(activeSessionId);
       setResult(data);
       setUiState("ready");
       addAnalysisMessages(data, audioMessageId);
+      void Promise.all([refreshSessions(), refreshMemory(activeSessionId)]);
     } catch (analysisError) {
       const typedError = analysisError as Error & { technicalDetail?: string };
       console.error("音频分析异常", typedError.technicalDetail || typedError);
@@ -335,21 +526,29 @@ export default function App() {
   async function sendTextMessage() {
     const text = inputText.trim();
     if (!text || isChatting) return;
-    const userId = Date.now();
-    const assistantId = userId + 1;
+    const userMessageId = Date.now();
+    const assistantId = userMessageId + 1;
     const history = messages.map((message) => ({
       role: message.role === "ai" ? "assistant" as const : "user" as const,
       content: message.text
     }));
     setMessages((previous) => [
       ...previous,
-      { id: userId, role: "user", text, time: nowTime(), emotion: manualEmotion },
+      { id: userMessageId, role: "user", text, time: nowTime(), emotion: currentEmotion },
       { id: assistantId, role: "ai", text: "正在整理你的感受…", time: nowTime(), emotion: "平静" }
     ]);
     setInputText("");
     setIsChatting(true);
     setError("");
-    const payload = { message: text, session_id: sessionId || undefined, history, latest_analysis: analysis };
+    const payload = {
+      message: text,
+      user_id: userId,
+      session_id: sessionId || undefined,
+      request_id: newRequestId(),
+      history,
+      latest_analysis: analysis
+    };
+    let activeSessionId = sessionId;
     let streamedText = "";
     const updateAssistant = (nextText: string) => {
       setMessages((previous) => previous.map((message) => message.id === assistantId ? { ...message, text: nextText } : message));
@@ -376,23 +575,31 @@ export default function App() {
         }
       });
       setSessionId(response.session_id);
+      activeSessionId = response.session_id;
       applySearchCalls(response.tool_calls || []);
       if (response.search_required && response.fallback_reason) updateSearchStatus("empty");
       if (!streamedText) updateAssistant(response.response);
     } catch (streamError) {
       console.warn("流式文字陪伴不可用，切换普通 JSON", streamError);
+      const streamMessage = (streamError as Error)?.message || "";
+      if (streamMessage.includes("10分钟后重新发送消息")) {
+        updateAssistant(streamMessage);
+        return;
+      }
       try {
         const response = await chatWithAgent(payload);
         setSessionId(response.session_id);
+        activeSessionId = response.session_id;
         applySearchCalls(response.tool_calls || []);
         if (response.search_required && response.fallback_reason) updateSearchStatus("empty");
         updateAssistant(response.response);
       } catch (chatError) {
         console.error("文字陪伴服务异常", chatError);
-        updateAssistant("文字陪伴服务暂时不可用，请确认后端已经启动后重试。你仍然可以继续录音或上传音频。");
+        updateAssistant((chatError as Error)?.message || "文字陪伴服务暂时不可用，请稍后重试。");
       }
     } finally {
       setIsChatting(false);
+      if (activeSessionId) void Promise.all([refreshSessions(), refreshMemory(activeSessionId)]);
     }
   }
 
@@ -414,13 +621,25 @@ export default function App() {
         <aside className="left-sidebar">
           <div className="side-title">会话历史</div>
           <div className="session-list">
-            {sessionShells.map(([title, time], index) => (
-              <button key={title} className={`session-item ${index === 0 ? "active" : ""}`}>
-                <span><strong>{title}</strong><small><Clock3 size={10} />{time}</small></span>
-              </button>
+            {sessions.map((session) => (
+              <div key={session.session_id} className={`session-item ${session.session_id === sessionId ? "active" : ""}`}>
+                <button className="session-open" onClick={() => void loadSession(session.session_id)}>
+                  <span><strong>{session.title}</strong><small><Clock3 size={10} />{sessionTime(session.updated_at)}</small></span>
+                </button>
+                <button
+                  className="session-delete"
+                  onClick={() => setPendingDelete(session)}
+                  disabled={isChatting || uiState === "recording" || uiState === "analyzing"}
+                  aria-label={`删除会话：${session.title}`}
+                  title="删除会话"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
             ))}
+            {!sessions.length && <div className="session-empty">{isLoadingSessions ? "正在读取会话…" : "还没有历史会话"}</div>}
           </div>
-          <button className="new-session"><Plus size={14} />新建会话</button>
+          <button className="new-session" onClick={startNewSession}><Plus size={14} />新建会话</button>
         </aside>
 
         <main className="main-stage">
@@ -446,8 +665,8 @@ export default function App() {
                         <MessageText text={message.text} />
                         {message.role === "ai" && message.searchStatus && (
                           <div className={`search-evidence ${message.searchStatus}`}>
-                            {message.searchStatus === "searching" && <><LoaderCircle size={13} />正在调用智谱夸克搜索</>}
-                            {message.searchStatus === "success" && <><CheckCircle2 size={13} />已联网检索 · {message.sourceCount || 0} 条可用来源</>}
+                            {message.searchStatus === "searching" && <><LoaderCircle size={13} />正在使用 DeepSeek 原生联网搜索</>}
+                            {message.searchStatus === "success" && <><CheckCircle2 size={13} />{message.sourceCount ? `已联网检索 · ${message.sourceCount} 条可用来源` : "已使用 DeepSeek 原生联网搜索"}</>}
                             {message.searchStatus === "empty" && <><MicOff size={13} />联网搜索未获得可用来源</>}
                           </div>
                         )}
@@ -489,6 +708,29 @@ export default function App() {
                 <section className="mood-card"><div className="panel-heading"><Sparkles size={15} />关键词线索</div><div className="chip-list">{keywords.length ? keywords.map((item, index) => <span key={index}>{evidenceText(item)}</span>) : <span>暂无真实数据</span>}</div></section>
                 <section className="mood-card"><div className="panel-heading"><ChevronRight size={15} />可能原因</div><div className="reason-list">{reasons.length ? reasons.slice(0, 3).map((item, index) => <p key={index}>{evidenceText(item)}</p>) : <p>完成分析后显示原因线索</p>}</div></section>
               </div>
+              <section className="mood-card long-term-card">
+                <div className="panel-heading"><Waves size={15} />跨会话长期情绪趋势</div>
+                <LongTermTrend trend={memorySummary?.long_term.trend} />
+              </section>
+              <div className="mood-columns memory-columns">
+                <section className="mood-card">
+                  <div className="panel-heading"><Sparkles size={15} />常见触发因素</div>
+                  <div className="chip-list">
+                    {memorySummary?.long_term.trend.common_triggers.length
+                      ? memorySummary.long_term.trend.common_triggers.map((item) => <span key={item.text}>{item.text} · {item.count}</span>)
+                      : <span>随真实语音分析逐步积累</span>}
+                  </div>
+                </section>
+                <section className="mood-card">
+                  <div className="panel-heading"><HeartHandshake size={15} />已确认陪伴偏好</div>
+                  <div className="reason-list">
+                    {memorySummary?.long_term.preferences.length
+                      ? memorySummary.long_term.preferences.map((item) => <p key={item.key}>{item.value}</p>)
+                      : <p>只有你明确表达后才会保存偏好</p>}
+                  </div>
+                </section>
+              </div>
+              <p className="memory-safety-note">{memorySummary?.safety_note || "记忆只保存在后端本地数据库中，不用于医疗或心理诊断。"}</p>
             </Tabs.Content>
           </Tabs.Root>
         </main>
@@ -496,13 +738,14 @@ export default function App() {
         <aside className="right-sidebar">
           <div className="side-title">情感分析</div>
           <section className="current-emotion" style={{ "--emotion": currentColor, "--emotion-glow": `${currentColor}33` } as React.CSSProperties}>
-            <div><span>当前识别情绪</span><strong>{currentEmotion}</strong></div>
+            <div><span>{manualEmotion ? "当前手动标注" : "当前识别情绪"}</span><strong>{currentEmotion}</strong></div>
             {confidenceRows.map(([label, value]) => <div className="metric-row" key={label}><span>{label}</span><small>{value ? formatPercent(value) : "—"}</small><div><i style={{ width: `${value * 100}%` }} /></div></div>)}
           </section>
 
           <section className="quick-emotions">
             <span className="panel-label">快速标记情绪</span>
-            <div>{quickEmotions.map(([label, color]) => <button key={label} className={manualEmotion === label && !analysis.fusion_prediction ? "active" : ""} style={{ "--emotion": color } as React.CSSProperties} onClick={() => setManualEmotion(label)}>{label}</button>)}</div>
+            <small className="quick-emotions-hint">{manualEmotion ? "已手动标注，再次点击该标签可取消" : "点击标签可覆盖当前识别结果"}</small>
+            <div>{quickEmotions.map(([label, color]) => <button key={label} className={manualEmotion === label ? "active" : ""} style={{ "--emotion": color } as React.CSSProperties} onClick={() => toggleManualEmotion(label)} aria-pressed={manualEmotion === label}>{label}</button>)}</div>
           </section>
 
           <section className="affirmation-card"><span className="panel-label">今日心语</span><p>“你不必假装一切都好。<br />允许自己感受，<br />是勇气的一种形式。”</p></section>
@@ -517,6 +760,31 @@ export default function App() {
           <section className="analysis-source"><FileAudio size={15} /><span>{result ? <><strong>真实语音分析已接入</strong><small>声学 · ASR · 多模态融合</small></> : <><strong>等待语音输入</strong><small>录音或上传音频后显示结果</small></>}</span>{result && <CheckCircle2 size={15} />}</section>
         </aside>
       </div>
+
+      {pendingDelete && (
+        <div className="dialog-backdrop" onMouseDown={(event) => {
+          if (event.currentTarget === event.target && !isDeletingSession) setPendingDelete(null);
+        }}>
+          <section className="delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" aria-describedby="delete-dialog-description">
+            <div className="dialog-icon"><AlertTriangle size={19} /></div>
+            <div className="dialog-copy">
+              <h2 id="delete-dialog-title">删除这段会话？</h2>
+              <p id="delete-dialog-description">
+                该会话的聊天记录、工具调用记录，以及与该会话关联的长期情绪事件都会从本地服务器永久删除。
+              </p>
+              <small>用户级已确认的陪伴偏好不会随本次会话删除。此操作不可撤销。</small>
+            </div>
+            <div className="dialog-actions">
+              <button className="dialog-cancel" onClick={() => setPendingDelete(null)} disabled={isDeletingSession} autoFocus>取消</button>
+              <button className="dialog-confirm" onClick={() => void confirmDeleteSession()} disabled={isDeletingSession}>
+                {isDeletingSession ? <><LoaderCircle className="spin" size={14} />正在删除</> : <><Trash2 size={14} />确认删除</>}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {notice && <div className="toast-notice" role="status" aria-live="polite"><CheckCircle2 size={15} />{notice}</div>}
     </div>
   );
 }

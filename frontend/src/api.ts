@@ -1,8 +1,18 @@
 import { safeUploadFilename } from "./recording";
-import type { AgentChatRequest, AgentChatResponse, AgentStreamToolEvent, AnalysisResponse, HealthResponse } from "./types";
+import type {
+  AgentChatRequest,
+  AgentChatResponse,
+  AgentStreamToolEvent,
+  AnalysisResponse,
+  HealthResponse,
+  MemorySummaryResponse,
+  SessionDetailResponse,
+  SessionRecord
+} from "./types";
 
 function analysisErrorMessage(error: unknown, stage: string, responseStatus: number) {
   const message = String((error as Error)?.message || error || "");
+  if (message.includes("记忆整理服务暂时不可用")) return message;
   if (/failed to fetch|networkerror|load failed/i.test(message) || stage.endsWith("_fetch")) return "无法连接分析服务，请确认后端已经启动";
   if (/timeout|timed out/i.test(message) || responseStatus === 408 || responseStatus === 504) return "音频分析超时，请稍后重试";
   if (responseStatus === 413) return "音频文件过大，请缩短录音或选择较小的文件";
@@ -18,7 +28,11 @@ export async function fetchHealth(): Promise<HealthResponse> {
   return response.json() as Promise<HealthResponse>;
 }
 
-export async function analyzeAudioBlob(blob: Blob, filename?: string): Promise<AnalysisResponse> {
+export async function analyzeAudioBlob(
+  blob: Blob,
+  filename?: string,
+  memoryContext?: { userId: string; sessionId?: string; requestId?: string }
+): Promise<AnalysisResponse> {
   let stage = "prepare";
   let responseStatus = 0;
   const safeFilename = safeUploadFilename(filename, blob);
@@ -29,13 +43,23 @@ export async function analyzeAudioBlob(blob: Blob, filename?: string): Promise<A
       const form = new FormData();
       form.append("file", blob, safeFilename);
       stage = "multipart_fetch";
-      response = await fetch("/api/analyze-audio", { method: "POST", body: form });
+      const headers: Record<string, string> = {};
+      if (memoryContext?.userId) headers["X-User-Id"] = memoryContext.userId;
+      if (memoryContext?.sessionId) headers["X-Session-Id"] = memoryContext.sessionId;
+      if (memoryContext?.requestId) headers["X-Request-Id"] = memoryContext.requestId;
+      response = await fetch("/api/analyze-audio", { method: "POST", headers, body: form });
     } catch (formError) {
       console.warn("multipart 上传失败，切换 raw body", formError);
       stage = "raw_fetch";
       response = await fetch("/api/analyze-audio", {
         method: "POST",
-        headers: { "Content-Type": blob.type || "application/octet-stream", "X-Filename": safeFilename },
+        headers: {
+          "Content-Type": blob.type || "application/octet-stream",
+          "X-Filename": safeFilename,
+          ...(memoryContext?.userId ? { "X-User-Id": memoryContext.userId } : {}),
+          ...(memoryContext?.sessionId ? { "X-Session-Id": memoryContext.sessionId } : {}),
+          ...(memoryContext?.requestId ? { "X-Request-Id": memoryContext.requestId } : {})
+        },
         body: blob
       });
     }
@@ -59,6 +83,37 @@ export async function analyzeAudioBlob(blob: Blob, filename?: string): Promise<A
   }
 }
 
+export async function listSessions(userId: string): Promise<SessionRecord[]> {
+  const response = await fetch(`/api/sessions?user_id=${encodeURIComponent(userId)}`);
+  const data = await response.json() as { ok: boolean; sessions?: SessionRecord[] };
+  if (!response.ok || !data.ok) throw new Error("会话历史暂时不可用");
+  return data.sessions || [];
+}
+
+export async function fetchSession(userId: string, sessionId: string): Promise<SessionDetailResponse> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(userId)}`);
+  const data = await response.json() as SessionDetailResponse;
+  if (!response.ok || !data.ok) throw new Error("无法读取这段会话");
+  return data;
+}
+
+export async function deleteSession(userId: string, sessionId: string): Promise<void> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(userId)}`, {
+    method: "DELETE"
+  });
+  const data = await response.json() as { ok?: boolean };
+  if (!response.ok || !data.ok) throw new Error("删除失败，请稍后重试");
+}
+
+export async function fetchMemorySummary(userId: string, sessionId?: string): Promise<MemorySummaryResponse> {
+  const query = new URLSearchParams({ user_id: userId });
+  if (sessionId) query.set("session_id", sessionId);
+  const response = await fetch(`/api/memory/summary?${query.toString()}`);
+  const data = await response.json() as MemorySummaryResponse;
+  if (!response.ok || !data.ok) throw new Error("记忆摘要暂时不可用");
+  return data;
+}
+
 export async function chatWithAgent(payload: AgentChatRequest): Promise<AgentChatResponse> {
   const response = await fetch("/api/agent/chat", {
     method: "POST",
@@ -80,7 +135,17 @@ export async function streamAgentChat(
     headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
     body: JSON.stringify(payload)
   });
-  if (!response.ok || !response.body) throw new Error("文字陪伴流式服务暂时不可用");
+  if (!response.ok) {
+    let message = "文字陪伴流式服务暂时不可用";
+    try {
+      const data = await response.json() as { message?: string };
+      if (data.message) message = data.message;
+    } catch {
+      // The public API intentionally exposes only stable Chinese messages.
+    }
+    throw new Error(message);
+  }
+  if (!response.body) throw new Error("文字陪伴流式服务暂时不可用");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
