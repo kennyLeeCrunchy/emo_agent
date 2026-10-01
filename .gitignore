@@ -13,6 +13,8 @@ __pycache__/
 *.key
 *.crt
 *.zip
+*.ppt
+*.pptx
 pem/
 
 # Local tunnel executable; install separately when needed.
@@ -27,6 +29,7 @@ backend/data/*.sqlite3-shm
 backend/data/*.sqlite3-wal
 
 .agents/
+docs/
 
 models/*
 !models/README.md
